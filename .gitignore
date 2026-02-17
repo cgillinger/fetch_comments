@@ -1,0 +1,7 @@
+*.log
+*.ndjson
+*.csv
+checkpoint.json
+.env
+__pycache__/
+*.pyc
