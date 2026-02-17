@@ -638,17 +638,23 @@ def main() -> None:
         for page in pages:
             if shutdown_event.is_set():
                 break
-            process_page(
-                session=session,
-                token=token,
-                writers=writers,
-                page=page,
-                since=since,
-                until=until,
-                delay=args.delay,
-                max_workers=args.max_workers,
-                checkpoint_path=args.checkpoint,
-            )
+            try:
+                process_page(
+                    session=session,
+                    token=token,
+                    writers=writers,
+                    page=page,
+                    since=since,
+                    until=until,
+                    delay=args.delay,
+                    max_workers=args.max_workers,
+                    checkpoint_path=args.checkpoint,
+                )
+            except requests.exceptions.HTTPError as exc:
+                logger.error(
+                    "Skipping page %s (%s) – API error: %s",
+                    page.get("name", "?"), page["id"], exc,
+                )
     except SystemExit:
         logger.info("Shutting down …")
     finally:
