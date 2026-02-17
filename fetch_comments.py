@@ -323,7 +323,7 @@ def _extract_comment_record(
     depth_level: int,
 ) -> dict[str, Any]:
     from_data = comment.get("from") or {}
-    commenter_id = from_data.get("id", "")
+    commenter_id = str(from_data.get("id", "")) if from_data.get("id") else ""
     commenter_name = from_data.get("name", "")
     commenter_link = from_data.get("link", "")
     if not commenter_link and commenter_id:
