@@ -404,10 +404,10 @@ def fetch_comments_for_post(
 # Main workflow
 # ---------------------------------------------------------------------------
 
-def validate_token(session: requests.Session, token: str) -> None:
+def validate_token(session: requests.Session) -> None:
     url = f"{GRAPH_API_BASE}/me"
     try:
-        resp = api_get(session, url, params={"access_token": token})
+        resp = api_get(session, url)
         uid = resp.get("id")
         if not uid:
             raise ValueError("Token validation returned no user id")
@@ -419,7 +419,6 @@ def validate_token(session: requests.Session, token: str) -> None:
 
 def resolve_pages(
     session: requests.Session,
-    token: str,
     page_ids: Optional[list[str]],
 ) -> list[dict[str, str]]:
     if page_ids:
@@ -427,7 +426,7 @@ def resolve_pages(
         for pid in page_ids:
             url = f"{GRAPH_API_BASE}/{pid}"
             try:
-                data = api_get(session, url, params={"fields": "id,name", "access_token": token})
+                data = api_get(session, url, params={"fields": "id,name"})
                 pages.append({"id": data["id"], "name": data.get("name", "")})
             except Exception as exc:
                 logger.error("Cannot access page %s: %s", pid, exc)
@@ -437,7 +436,7 @@ def resolve_pages(
         return pages
 
     url = f"{GRAPH_API_BASE}/me/accounts"
-    params = {"fields": "id,name", "limit": DEFAULT_LIMIT, "access_token": token}
+    params = {"fields": "id,name", "limit": DEFAULT_LIMIT}
     pages_raw = paginate_all(session, url, params=params)
     pages = [{"id": p["id"], "name": p.get("name", "")} for p in pages_raw]
     if not pages:
@@ -449,7 +448,6 @@ def resolve_pages(
 
 def fetch_posts_for_page(
     session: requests.Session,
-    token: str,
     page_id: str,
     since: str,
     until: str,
@@ -461,7 +459,6 @@ def fetch_posts_for_page(
         "since": since,
         "until": until,
         "limit": DEFAULT_LIMIT,
-        "access_token": token,
     }
     posts = paginate_all(session, url, params=params, delay=delay)
     logger.info("Page %s: fetched %d posts", page_id, len(posts))
@@ -470,7 +467,6 @@ def fetch_posts_for_page(
 
 def process_page(
     session: requests.Session,
-    token: str,
     writers: StreamWriters,
     page: dict[str, str],
     since: str,
@@ -486,7 +482,7 @@ def process_page(
     checkpoint = load_checkpoint(checkpoint_path)
     completed_posts: set[str] = set(checkpoint.get("completed_posts", {}).get(page_id, []))
 
-    posts = fetch_posts_for_page(session, token, page_id, since, until, delay)
+    posts = fetch_posts_for_page(session, page_id, since, until, delay)
 
     def _handle_post(post: dict[str, Any]) -> int:
         pid = post["id"]
@@ -627,9 +623,9 @@ def main() -> None:
     session = requests.Session()
     session.params = {"access_token": token}  # type: ignore[assignment]
 
-    validate_token(session, token)
+    validate_token(session)
 
-    pages = resolve_pages(session, token, args.page_ids)
+    pages = resolve_pages(session, args.page_ids)
     logger.info("Pages to process: %s", [p["id"] for p in pages])
 
     writers = StreamWriters(args.output_ndjson, args.output_csv)
@@ -641,7 +637,6 @@ def main() -> None:
             try:
                 process_page(
                     session=session,
-                    token=token,
                     writers=writers,
                     page=page,
                     since=since,
