@@ -417,32 +417,63 @@ def validate_token(session: requests.Session) -> None:
         sys.exit(1)
 
 
+def _fetch_all_pages(session: requests.Session) -> list[dict[str, str]]:
+    """Fetch all pages from /me/accounts including page access tokens."""
+    url = f"{GRAPH_API_BASE}/me/accounts"
+    params = {"fields": "id,name,access_token", "limit": DEFAULT_LIMIT}
+    pages_raw = paginate_all(session, url, params=params)
+    return [
+        {
+            "id": p["id"],
+            "name": p.get("name", ""),
+            "page_token": p.get("access_token", ""),
+        }
+        for p in pages_raw
+    ]
+
+
+def _filter_placeholders(pages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Remove internal SRholder placeholder pages."""
+    filtered = []
+    for p in pages:
+        if p["name"].lower().startswith("srholder"):
+            logger.info("Skipping placeholder page: %s (%s)", p["name"], p["id"])
+        else:
+            filtered.append(p)
+    return filtered
+
+
 def resolve_pages(
     session: requests.Session,
     page_ids: Optional[list[str]],
 ) -> list[dict[str, str]]:
+    all_pages = _fetch_all_pages(session)
+    if not all_pages:
+        logger.error("No pages found for this token – exiting")
+        sys.exit(1)
+    logger.info("Resolved %d page(s) from /me/accounts", len(all_pages))
+
     if page_ids:
+        token_map = {p["id"]: p for p in all_pages}
         pages = []
         for pid in page_ids:
-            url = f"{GRAPH_API_BASE}/{pid}"
-            try:
-                data = api_get(session, url, params={"fields": "id,name"})
-                pages.append({"id": data["id"], "name": data.get("name", "")})
-            except Exception as exc:
-                logger.error("Cannot access page %s: %s", pid, exc)
+            if pid in token_map:
+                pages.append(token_map[pid])
+            else:
+                logger.error(
+                    "Page %s not found in /me/accounts – no page token available, skipping", pid,
+                )
         if not pages:
             logger.error("No accessible pages – exiting")
             sys.exit(1)
-        return pages
+    else:
+        pages = all_pages
 
-    url = f"{GRAPH_API_BASE}/me/accounts"
-    params = {"fields": "id,name", "limit": DEFAULT_LIMIT}
-    pages_raw = paginate_all(session, url, params=params)
-    pages = [{"id": p["id"], "name": p.get("name", "")} for p in pages_raw]
+    pages = _filter_placeholders(pages)
     if not pages:
-        logger.error("No pages found for this token – exiting")
+        logger.error("No pages remaining after filtering – exiting")
         sys.exit(1)
-    logger.info("Resolved %d page(s)", len(pages))
+
     return pages
 
 
@@ -466,7 +497,6 @@ def fetch_posts_for_page(
 
 
 def process_page(
-    session: requests.Session,
     writers: StreamWriters,
     page: dict[str, str],
     since: str,
@@ -477,12 +507,19 @@ def process_page(
 ) -> None:
     page_id = page["id"]
     page_name = page["name"]
+    page_token = page.get("page_token", "")
+    if not page_token:
+        logger.error("No page token for %s (%s) – skipping", page_name, page_id)
+        return
     logger.info("Processing page: %s (%s)", page_name, page_id)
+
+    page_session = requests.Session()
+    page_session.params = {"access_token": page_token}  # type: ignore[assignment]
 
     checkpoint = load_checkpoint(checkpoint_path)
     completed_posts: set[str] = set(checkpoint.get("completed_posts", {}).get(page_id, []))
 
-    posts = fetch_posts_for_page(session, page_id, since, until, delay)
+    posts = fetch_posts_for_page(page_session, page_id, since, until, delay)
 
     def _handle_post(post: dict[str, Any]) -> int:
         pid = post["id"]
@@ -490,7 +527,7 @@ def process_page(
             logger.debug("Skipping already-processed post %s", pid)
             return 0
         count = fetch_comments_for_post(
-            session, writers, page_id, page_name, post, delay,
+            page_session, writers, page_id, page_name, post, delay,
         )
         logger.info("Post %s: %d comments", pid, count)
         return count
@@ -636,7 +673,6 @@ def main() -> None:
                 break
             try:
                 process_page(
-                    session=session,
                     writers=writers,
                     page=page,
                     since=since,
