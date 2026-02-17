@@ -10,6 +10,7 @@ import os
 import random
 import re
 import signal
+import unicodedata
 import sys
 import threading
 import time
@@ -250,9 +251,16 @@ CSV_COLUMNS = [
 ]
 
 
+def _safe_filename(name: str) -> str:
+    """Transliterate to ASCII-safe filename: Ö→O, Å→A, Ä→A, etc."""
+    decomposed = unicodedata.normalize("NFKD", name)
+    ascii_text = decomposed.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^\w\-]", "_", ascii_text).strip("_")
+
+
 def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str) -> str:
     """Build output filename: PageName_YYMMDD-YYMMDD_comments.ext"""
-    safe_name = re.sub(r"[^\w\-]", "_", page.get("name", page["id"]), flags=re.ASCII)
+    safe_name = _safe_filename(page.get("name", page["id"]))
     since_short = since.replace("-", "")[2:]  # 2024-01-15 → 240115
     until_short = until.replace("-", "")[2:]
     return f"{safe_name}_{since_short}-{until_short}_comments{suffix}"
