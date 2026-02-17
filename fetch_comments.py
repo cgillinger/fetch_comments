@@ -250,15 +250,12 @@ CSV_COLUMNS = [
 ]
 
 
-def _page_csv_path(base_csv: str, page: dict[str, str]) -> str:
-    """Derive a per-page CSV path from the base path and page info."""
-    p = Path(base_csv)
-    safe_name = re.sub(r"[^\w\-]", "_", page.get("name", ""), flags=re.ASCII)
-    if safe_name:
-        stem = f"{p.stem}_{safe_name}_{page['id']}"
-    else:
-        stem = f"{p.stem}_{page['id']}"
-    return str(p.with_name(stem + p.suffix))
+def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str) -> str:
+    """Build output filename: PageName_YYMMDD-YYMMDD_comments.ext"""
+    safe_name = re.sub(r"[^\w\-]", "_", page.get("name", page["id"]), flags=re.ASCII)
+    since_short = since.replace("-", "")[2:]  # 2024-01-15 → 240115
+    until_short = until.replace("-", "")[2:]
+    return f"{safe_name}_{since_short}-{until_short}_comments{suffix}"
 
 
 class StreamWriters:
@@ -626,13 +623,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-ndjson",
-        default="comments.ndjson",
-        help="Output NDJSON file path (default: comments.ndjson)",
+        default=None,
+        help="Override NDJSON path (default: auto-generated per page)",
     )
     parser.add_argument(
         "--output-csv",
-        default="comments.csv",
-        help="Base CSV file path; one CSV per page is created (default: comments.csv → comments_<name>_<id>.csv)",
+        default=None,
+        help="Override CSV path (default: auto-generated per page)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -681,9 +678,10 @@ def main() -> None:
         for page in pages:
             if shutdown_event.is_set():
                 break
-            csv_path = _page_csv_path(args.output_csv, page)
-            writers = StreamWriters(args.output_ndjson, csv_path)
-            logger.info("CSV output for page %s: %s", page["id"], csv_path)
+            csv_path = args.output_csv or _page_output_path(page, since, until, ".csv")
+            ndjson_path = args.output_ndjson or _page_output_path(page, since, until, ".ndjson")
+            writers = StreamWriters(ndjson_path, csv_path)
+            logger.info("Output for page %s: %s / %s", page["id"], csv_path, ndjson_path)
             try:
                 process_page(
                     writers=writers,
