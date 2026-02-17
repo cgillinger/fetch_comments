@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -247,6 +248,17 @@ CSV_COLUMNS = [
     "attachment_type",
     "message_tags",
 ]
+
+
+def _page_csv_path(base_csv: str, page: dict[str, str]) -> str:
+    """Derive a per-page CSV path from the base path and page info."""
+    p = Path(base_csv)
+    safe_name = re.sub(r"[^\w\-]", "_", page.get("name", ""), flags=re.ASCII)
+    if safe_name:
+        stem = f"{p.stem}_{safe_name}_{page['id']}"
+    else:
+        stem = f"{p.stem}_{page['id']}"
+    return str(p.with_name(stem + p.suffix))
 
 
 class StreamWriters:
@@ -620,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-csv",
         default="comments.csv",
-        help="Output CSV file path (default: comments.csv)",
+        help="Base CSV file path; one CSV per page is created (default: comments.csv → comments_<name>_<id>.csv)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -665,12 +677,13 @@ def main() -> None:
     pages = resolve_pages(session, args.page_ids)
     logger.info("Pages to process: %s", [p["id"] for p in pages])
 
-    writers = StreamWriters(args.output_ndjson, args.output_csv)
-
     try:
         for page in pages:
             if shutdown_event.is_set():
                 break
+            csv_path = _page_csv_path(args.output_csv, page)
+            writers = StreamWriters(args.output_ndjson, csv_path)
+            logger.info("CSV output for page %s: %s", page["id"], csv_path)
             try:
                 process_page(
                     writers=writers,
@@ -686,10 +699,10 @@ def main() -> None:
                     "Skipping page %s (%s) – API error: %s",
                     page.get("name", "?"), page["id"], exc,
                 )
+            finally:
+                writers.close()
     except SystemExit:
         logger.info("Shutting down …")
-    finally:
-        writers.close()
 
     logger.info("Done – total API requests: %d", request_counter)
 
