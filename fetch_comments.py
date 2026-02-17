@@ -258,12 +258,26 @@ def _safe_filename(name: str) -> str:
     return re.sub(r"[^\w\-]", "_", ascii_text).strip("_")
 
 
+_SWEDISH_MONTHS = {
+    1: "JAN", 2: "FEB", 3: "MAR", 4: "APR",
+    5: "MAJ", 6: "JUN", 7: "JUL", 8: "AUG",
+    9: "SEP", 10: "OKT", 11: "NOV", 12: "DEC",
+}
+
+
+def _month_folder(since: str) -> str:
+    """Derive folder name from since date: '2026-01-15' → '26-JAN'."""
+    dt = datetime.fromisoformat(since)
+    return f"{dt.strftime('%y')}-{_SWEDISH_MONTHS[dt.month]}"
+
+
 def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str) -> str:
-    """Build output filename: PageName_YYMMDD-YYMMDD_comments.ext"""
+    """Build output path: 26-JAN/PageName_YYMMDD-YYMMDD_comments.ext"""
+    folder = _month_folder(since)
     safe_name = _safe_filename(page.get("name", page["id"]))
     since_short = since.replace("-", "")[2:]  # 2024-01-15 → 240115
     until_short = until.replace("-", "")[2:]
-    return f"{safe_name}_{since_short}-{until_short}_comments{suffix}"
+    return str(Path(folder) / f"{safe_name}_{since_short}-{until_short}_comments{suffix}")
 
 
 class StreamWriters:
@@ -688,6 +702,8 @@ def main() -> None:
                 break
             csv_path = args.output_csv or _page_output_path(page, since, until, ".csv")
             ndjson_path = args.output_ndjson or _page_output_path(page, since, until, ".ndjson")
+            Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(ndjson_path).parent.mkdir(parents=True, exist_ok=True)
             writers = StreamWriters(ndjson_path, csv_path)
             logger.info("Output for page %s: %s / %s", page["id"], csv_path, ndjson_path)
             try:
