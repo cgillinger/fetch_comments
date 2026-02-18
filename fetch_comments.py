@@ -150,6 +150,7 @@ def api_get(
 
         try:
             resp = session.get(url, params=params, timeout=60)
+            logger.debug("Request #%d  final URL: %s", count, resp.url)
         except requests.RequestException as exc:
             logger.error("Network error (attempt %d/%d): %s", attempt, MAX_RETRIES, exc)
             if attempt == MAX_RETRIES:
@@ -170,6 +171,17 @@ def api_get(
             if attempt == MAX_RETRIES:
                 resp.raise_for_status()
             time.sleep(wait)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+            continue
+
+        if resp.status_code >= 500:
+            logger.warning(
+                "Server error %d (attempt %d/%d) – sleeping %ds",
+                resp.status_code, attempt, MAX_RETRIES, backoff,
+            )
+            if attempt == MAX_RETRIES:
+                resp.raise_for_status()
+            time.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
             continue
 
@@ -384,6 +396,7 @@ def fetch_comments_for_post(
     page_name: str,
     post: dict[str, Any],
     delay: float,
+    token: str,
 ) -> int:
     """Fetch all comments (including nested replies) for a single post. Returns count."""
     post_id = post["id"]
@@ -401,7 +414,11 @@ def fetch_comments_for_post(
             return
 
         url = f"{GRAPH_API_BASE}/{parent_id}/comments"
-        params = {"fields": COMMENT_FIELDS, "limit": DEFAULT_LIMIT}
+        params: dict[str, Any] = {
+            "access_token": token,
+            "fields": COMMENT_FIELDS,
+            "limit": DEFAULT_LIMIT,
+        }
         comments = paginate_all(session, url, params=params, delay=delay)
 
         for comment in comments:
@@ -435,10 +452,10 @@ def fetch_comments_for_post(
 # Main workflow
 # ---------------------------------------------------------------------------
 
-def validate_token(session: requests.Session) -> None:
+def validate_token(session: requests.Session, token: str) -> None:
     url = f"{GRAPH_API_BASE}/me"
     try:
-        resp = api_get(session, url)
+        resp = api_get(session, url, params={"access_token": token})
         uid = resp.get("id")
         if not uid:
             raise ValueError("Token validation returned no user id")
@@ -448,10 +465,14 @@ def validate_token(session: requests.Session) -> None:
         sys.exit(1)
 
 
-def _fetch_all_pages(session: requests.Session) -> list[dict[str, str]]:
+def _fetch_all_pages(session: requests.Session, token: str) -> list[dict[str, str]]:
     """Fetch all pages from /me/accounts including page access tokens."""
     url = f"{GRAPH_API_BASE}/me/accounts"
-    params = {"fields": "id,name,access_token", "limit": DEFAULT_LIMIT}
+    params: dict[str, Any] = {
+        "access_token": token,
+        "fields": "id,name,access_token",
+        "limit": DEFAULT_LIMIT,
+    }
     pages_raw = paginate_all(session, url, params=params)
     return [
         {
@@ -477,8 +498,9 @@ def _filter_placeholders(pages: list[dict[str, str]]) -> list[dict[str, str]]:
 def resolve_pages(
     session: requests.Session,
     page_ids: Optional[list[str]],
+    token: str,
 ) -> list[dict[str, str]]:
-    all_pages = _fetch_all_pages(session)
+    all_pages = _fetch_all_pages(session, token)
     if not all_pages:
         logger.error("No pages found for this token – exiting")
         sys.exit(1)
@@ -514,9 +536,11 @@ def fetch_posts_for_page(
     since: str,
     until: str,
     delay: float,
+    token: str,
 ) -> list[dict[str, Any]]:
     url = f"{GRAPH_API_BASE}/{page_id}/posts"
-    params = {
+    params: dict[str, Any] = {
+        "access_token": token,
         "fields": POST_FIELDS,
         "since": since,
         "until": until,
@@ -545,12 +569,11 @@ def process_page(
     logger.info("Processing page: %s (%s)", page_name, page_id)
 
     page_session = requests.Session()
-    page_session.params = {"access_token": page_token}  # type: ignore[assignment]
 
     checkpoint = load_checkpoint(checkpoint_path)
     completed_posts: set[str] = set(checkpoint.get("completed_posts", {}).get(page_id, []))
 
-    posts = fetch_posts_for_page(page_session, page_id, since, until, delay)
+    posts = fetch_posts_for_page(page_session, page_id, since, until, delay, token=page_token)
 
     def _handle_post(post: dict[str, Any]) -> int:
         pid = post["id"]
@@ -558,7 +581,7 @@ def process_page(
             logger.debug("Skipping already-processed post %s", pid)
             return 0
         count = fetch_comments_for_post(
-            page_session, writers, page_id, page_name, post, delay,
+            page_session, writers, page_id, page_name, post, delay, token=page_token,
         )
         logger.info("Post %s: %d comments", pid, count)
         return count
@@ -689,11 +712,10 @@ def main() -> None:
         sys.exit(1)
 
     session = requests.Session()
-    session.params = {"access_token": token}  # type: ignore[assignment]
 
-    validate_token(session)
+    validate_token(session, token)
 
-    pages = resolve_pages(session, args.page_ids)
+    pages = resolve_pages(session, args.page_ids, token)
     logger.info("Pages to process: %s", [p["id"] for p in pages])
 
     try:
