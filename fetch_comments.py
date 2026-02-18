@@ -419,7 +419,16 @@ def fetch_comments_for_post(
             "fields": COMMENT_FIELDS,
             "limit": DEFAULT_LIMIT,
         }
-        comments = paginate_all(session, url, params=params, delay=delay)
+        try:
+            comments = paginate_all(session, url, params=params, delay=delay)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                logger.info(
+                    "Post %s has no /comments edge or is unsupported – skipping",
+                    parent_id,
+                )
+                return
+            raise
 
         for comment in comments:
             if shutdown_event.is_set():
