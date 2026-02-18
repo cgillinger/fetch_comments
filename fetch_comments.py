@@ -44,7 +44,7 @@ COMMENT_FIELDS = (
     "reactions.summary(true)"
 )
 
-POST_FIELDS = "id,created_time,permalink_url,status_type,attachments"
+POST_FIELDS = "id,created_time,permalink_url,status_type,attachments,message"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -246,6 +246,7 @@ CSV_COLUMNS = [
     "post_id",
     "post_created_time",
     "post_permalink",
+    "post_message",
     "comment_id",
     "parent_comment_id",
     "depth_level",
@@ -331,6 +332,7 @@ def _extract_comment_record(
     post_id: str,
     post_created_time: str,
     post_permalink: str,
+    post_message: str,
     parent_comment_id: Optional[str],
     depth_level: int,
 ) -> dict[str, Any]:
@@ -359,6 +361,7 @@ def _extract_comment_record(
         "post_id": post_id,
         "post_created_time": post_created_time,
         "post_permalink": post_permalink,
+        "post_message": post_message,
         "comment_id": comment.get("id", ""),
         "parent_comment_id": parent_comment_id or "",
         "depth_level": depth_level,
@@ -402,6 +405,7 @@ def fetch_comments_for_post(
     post_id = post["id"]
     post_created_time = post.get("created_time", "")
     post_permalink = post.get("permalink_url", "")
+    post_message = post.get("message", "")
     total = 0
 
     def _fetch_level(
@@ -444,6 +448,7 @@ def fetch_comments_for_post(
                 post_id=post_id,
                 post_created_time=post_created_time,
                 post_permalink=post_permalink,
+                post_message=post_message,
                 parent_comment_id=parent_comment_id,
                 depth_level=depth,
             )
