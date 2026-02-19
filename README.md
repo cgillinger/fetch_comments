@@ -69,7 +69,7 @@ These dates filter by **post publication date**, not comment creation date. All 
 | `--access-token` | from env/`.env` | Meta Graph API access token |
 | `--page-ids` | all accessible pages | Space-separated list of specific Page IDs to process |
 | `--week` | off | Split output into weekly files (ISO weeks, Mon–Sun) |
-| `--clean` | off | Also produce token-efficient `*_clean` files for LLM analysis |
+| `--clean` | off | Produce only a token-efficient clean CSV (no NDJSON) |
 | `--output-ndjson` | auto-generated | Override NDJSON path |
 | `--csv` | off | Also produce CSV output |
 | `--output-csv` | auto-generated | Override CSV path (implies `--csv`) |
@@ -156,39 +156,69 @@ Standard CSV with headers. Suitable for Excel, Google Sheets, pandas, etc.
 
 ## Clean Mode (`--clean`)
 
-Generates additional token-efficient export files optimized for LLM-based qualitative analysis. The regular (full) export is always produced — `--clean` adds `*_clean.ndjson` (and `*_clean.csv` if `--csv` is used) alongside the default output.
+Generates a single token-efficient CSV optimised for LLM ingestion. **No NDJSON is produced** in clean mode. The default (full) export is unchanged when `--clean` is not used.
 
 ```bash
 python fetch_comments.py --since 2025-11-01 --until 2025-11-07 --clean
 ```
 
-This produces both `PageName_251101-251107_comments.ndjson` and `PageName_251101-251107_comments_clean.ndjson`.
+Produces only:
 
-### What changes in clean mode
+```
+26-NOV/PageName_251101-251107_comments_clean.csv
+```
 
-**Kept fields:**
+With a custom output path:
 
-| Field | Notes |
-|---|---|
-| `created_time` | Comment timestamp |
-| `post_id` | Groups comments by post |
-| `depth_level` | `0` = top-level, `1`+ = reply |
-| `is_hidden` | Hidden by page admin |
-| `reaction_count` | Total reactions (all types) |
-| `message` | Comment text |
-| `post_message` | Truncated to 200 characters |
+```bash
+python fetch_comments.py --since 2025-11-01 --until 2025-11-07 --clean --output-csv data/output.csv
+```
 
-**Removed fields:** `page_id`, `page_name`, `post_created_time`, `post_permalink`, `comment_id`, `parent_comment_id`, `commenter_id`, `commenter_name`, `commenter_profile_link`, `like_count`, `reply_count`, `attachment_type`, `message_tags`.
+Produces: `data/output_clean.csv`
 
-`reply_count` is removed because reply structure can be derived from `depth_level` (depth > 0 = reply in a thread).
+### Clean CSV schema (strict column order)
 
-**Post message truncation:** `post_message` is truncated to 200 characters (with "…" appended) to reduce token usage while preserving enough context for analysis.
+| # | Column | Type | Notes |
+|---|---|---|---|
+| 1 | `created_time_unix` | integer | ISO-8601 → Unix timestamp (seconds, UTC) |
+| 2 | `post_id` | string | Groups comments by post |
+| 3 | `depth_level` | integer | `0` = top-level, `1`+ = reply |
+| 4 | `is_hidden` | 0/1 | `1` = hidden by page admin |
+| 5 | `reaction_count` | integer | Total reactions (all types) |
+| 6 | `message` | string | Sanitised comment text |
+
+No other columns are included.
+
+**Example row:**
+
+```csv
+1730620917,163892707053917_1026716302894344,0,0,12,"Här är det redan vitt på marken."
+```
+
+### Field transformations
+
+- **`created_time`** is converted from ISO-8601 to a Unix timestamp (integer seconds). Parse failures produce an empty field and a logged warning.
+- **`is_hidden`** is mapped to `1` (hidden) / `0` (visible).
+- **`message`** is sanitised for stable CSV and LLM ingestion:
+  - Leading/trailing whitespace stripped.
+  - `\r\n`, `\r`, `\n` replaced with a single space.
+  - Multiple consecutive whitespace collapsed into one space.
+  - Null bytes (`\x00`) removed.
+  - UTF-8 characters preserved; text is **not** truncated.
+
+### Removed fields
+
+`page_id`, `page_name`, `post_created_time`, `post_permalink`, `post_message`, `comment_id`, `parent_comment_id`, `commenter_id`, `commenter_name`, `commenter_profile_link`, `like_count`, `reply_count`, `attachment_type`, `message_tags`.
+
+`reply_count` is excluded because replies can be derived from `depth_level` (`depth_level > 0` means the comment is a reply).
+
+`post_message` is excluded to reduce token count — it repeats per comment and the post context can be joined via `post_id` when needed.
 
 ### Combining with other flags
 
 ```bash
-# Clean + weekly split + CSV
-python fetch_comments.py --since 2025-10-01 --until 2025-10-31 --week --clean --csv
+# Clean + weekly split
+python fetch_comments.py --since 2025-10-01 --until 2025-10-31 --week --clean
 ```
 
 ## Resume / Checkpoint
