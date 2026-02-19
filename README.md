@@ -68,8 +68,11 @@ These dates filter by **post publication date**, not comment creation date. All 
 |---|---|---|
 | `--access-token` | from env/`.env` | Meta Graph API access token |
 | `--page-ids` | all accessible pages | Space-separated list of specific Page IDs to process |
-| `--output-ndjson` | `comments.ndjson` | Output file path for NDJSON format |
-| `--output-csv` | `comments.csv` | Output file path for CSV format |
+| `--week` | off | Split output into weekly files (ISO weeks, Mon–Sun) |
+| `--clean` | off | Also produce token-efficient `*_clean` files for LLM analysis |
+| `--output-ndjson` | auto-generated | Override NDJSON path |
+| `--csv` | off | Also produce CSV output |
+| `--output-csv` | auto-generated | Override CSV path (implies `--csv`) |
 | `--checkpoint` | `checkpoint.json` | Checkpoint file for resume support |
 | `--delay` | `0.0` | Delay in seconds between API calls |
 | `--max-workers` | `5` | Max parallel threads per page |
@@ -150,6 +153,43 @@ Standard CSV with headers. Suitable for Excel, Google Sheets, pandas, etc.
 | `is_hidden` | Whether the comment is hidden by the page admin |
 | `attachment_type` | Type of attachment (photo, video, sticker, etc.) |
 | `message_tags` | Tagged users/pages in the comment (JSON array) |
+
+## Clean Mode (`--clean`)
+
+Generates additional token-efficient export files optimized for LLM-based qualitative analysis. The regular (full) export is always produced — `--clean` adds `*_clean.ndjson` (and `*_clean.csv` if `--csv` is used) alongside the default output.
+
+```bash
+python fetch_comments.py --since 2025-11-01 --until 2025-11-07 --clean
+```
+
+This produces both `PageName_251101-251107_comments.ndjson` and `PageName_251101-251107_comments_clean.ndjson`.
+
+### What changes in clean mode
+
+**Kept fields:**
+
+| Field | Notes |
+|---|---|
+| `created_time` | Comment timestamp |
+| `post_id` | Groups comments by post |
+| `depth_level` | `0` = top-level, `1`+ = reply |
+| `is_hidden` | Hidden by page admin |
+| `reaction_count` | Total reactions (all types) |
+| `message` | Comment text |
+| `post_message` | Truncated to 200 characters |
+
+**Removed fields:** `page_id`, `page_name`, `post_created_time`, `post_permalink`, `comment_id`, `parent_comment_id`, `commenter_id`, `commenter_name`, `commenter_profile_link`, `like_count`, `reply_count`, `attachment_type`, `message_tags`.
+
+`reply_count` is removed because reply structure can be derived from `depth_level` (depth > 0 = reply in a thread).
+
+**Post message truncation:** `post_message` is truncated to 200 characters (with "…" appended) to reduce token usage while preserving enough context for analysis.
+
+### Combining with other flags
+
+```bash
+# Clean + weekly split + CSV
+python fetch_comments.py --since 2025-10-01 --until 2025-10-31 --week --clean --csv
+```
 
 ## Resume / Checkpoint
 
