@@ -791,7 +791,8 @@ def main() -> None:
                 )
             for page in pages:
                 for w_since, w_until in weeks:
-                    work_items.append((page, w_since, w_until, since))
+                    # folder_date = w_since → folder determined by week start
+                    work_items.append((page, w_since, w_until, w_since))
         else:
             for page in pages:
                 work_items.append((page, since, until, None))
