@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -284,9 +284,34 @@ def _month_folder(since: str) -> str:
     return f"{dt.strftime('%y')}-{_SWEDISH_MONTHS[dt.month]}"
 
 
-def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str) -> str:
-    """Build output path: 26-JAN/PageName_YYMMDD-YYMMDD_comments.ext"""
-    folder = _month_folder(since)
+def _split_into_weeks(since: str, until: str) -> list[tuple[str, str]]:
+    """Split a date range into ISO week chunks (Mon–Sun).
+
+    The first and last chunks may be partial weeks, clipped to the
+    overall since/until boundaries.  Returns a list of
+    (start_date, end_date) ISO-8601 string pairs.
+    """
+    start = date.fromisoformat(since)
+    end = date.fromisoformat(until)
+    weeks: list[tuple[str, str]] = []
+    current = start
+    while current <= end:
+        # days until Sunday (weekday: Mon=0 … Sun=6)
+        days_until_sunday = 6 - current.weekday()
+        week_end = min(current + timedelta(days=days_until_sunday), end)
+        weeks.append((current.isoformat(), week_end.isoformat()))
+        current = week_end + timedelta(days=1)
+    return weeks
+
+
+def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str, *, folder_date: str | None = None) -> str:
+    """Build output path: 26-JAN/PageName_YYMMDD-YYMMDD_comments.ext
+
+    *folder_date* overrides the date used for the folder name (useful in
+    weekly mode where the folder should reflect the original --since month
+    rather than the individual week start).
+    """
+    folder = _month_folder(folder_date or since)
     safe_name = _safe_filename(page.get("name", page["id"]))
     since_short = since.replace("-", "")[2:]  # 2024-01-15 → 240115
     until_short = until.replace("-", "")[2:]
@@ -687,6 +712,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="End date (ISO-8601, e.g. 2024-12-31)",
     )
     parser.add_argument(
+        "--week",
+        action="store_true",
+        default=False,
+        help="Split output into weekly files (ISO weeks, Mon–Sun). "
+             "Files are saved in the same month folder.",
+    )
+    parser.add_argument(
         "--output-ndjson",
         default=None,
         help="Override NDJSON path (default: auto-generated per page)",
@@ -746,15 +778,38 @@ def main() -> None:
 
     try:
         emit_csv = args.csv or args.output_csv is not None
-        for page in pages:
+
+        # Build work items: (page, item_since, item_until, folder_date)
+        work_items: list[tuple[dict, str, str, str | None]] = []
+        if args.week:
+            weeks = _split_into_weeks(since, until)
+            logger.info("Weekly split mode: %d chunk(s)", len(weeks))
+            if args.output_ndjson or args.output_csv:
+                logger.warning(
+                    "--output-ndjson / --output-csv ignored in --week mode "
+                    "(paths are auto-generated per week)"
+                )
+            for page in pages:
+                for w_since, w_until in weeks:
+                    # folder_date = w_since → folder determined by week start
+                    work_items.append((page, w_since, w_until, w_since))
+        else:
+            for page in pages:
+                work_items.append((page, since, until, None))
+
+        for page, item_since, item_until, folder_date in work_items:
             if shutdown_event.is_set():
                 break
-            ndjson_path = args.output_ndjson or _page_output_path(page, since, until, ".ndjson")
-            csv_path = None
-            if emit_csv:
-                csv_path = args.output_csv or _page_output_path(page, since, until, ".csv")
-                Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            if folder_date:
+                # Weekly mode – always use auto-generated paths
+                ndjson_path = _page_output_path(page, item_since, item_until, ".ndjson", folder_date=folder_date)
+                csv_path = _page_output_path(page, item_since, item_until, ".csv", folder_date=folder_date) if emit_csv else None
+            else:
+                ndjson_path = args.output_ndjson or _page_output_path(page, item_since, item_until, ".ndjson")
+                csv_path = (args.output_csv or _page_output_path(page, item_since, item_until, ".csv")) if emit_csv else None
             Path(ndjson_path).parent.mkdir(parents=True, exist_ok=True)
+            if csv_path:
+                Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
             writers = StreamWriters(ndjson_path, csv_path)
             if csv_path:
                 logger.info("Output for page %s: %s / %s", page["id"], ndjson_path, csv_path)
@@ -764,8 +819,8 @@ def main() -> None:
                 process_page(
                     writers=writers,
                     page=page,
-                    since=since,
-                    until=until,
+                    since=item_since,
+                    until=item_until,
                     delay=args.delay,
                     max_workers=args.max_workers,
                     checkpoint_path=args.checkpoint,
