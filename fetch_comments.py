@@ -294,31 +294,37 @@ def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str)
 
 
 class StreamWriters:
-    """Writes records as NDJSON and CSV in streaming fashion."""
+    """Writes records as NDJSON and optionally CSV in streaming fashion."""
 
-    def __init__(self, ndjson_path: str, csv_path: str) -> None:
+    def __init__(self, ndjson_path: str, csv_path: str | None = None) -> None:
         self._ndjson_fh = open(ndjson_path, "a", encoding="utf-8")
-        self._csv_fh = open(csv_path, "a", encoding="utf-8", newline="")
-        self._csv_writer = csv.DictWriter(
-            self._csv_fh, fieldnames=CSV_COLUMNS, extrasaction="ignore",
-        )
-        if self._csv_fh.tell() == 0:
-            self._csv_writer.writeheader()
+        self._csv_fh = None
+        self._csv_writer = None
+        if csv_path is not None:
+            self._csv_fh = open(csv_path, "a", encoding="utf-8", newline="")
+            self._csv_writer = csv.DictWriter(
+                self._csv_fh, fieldnames=CSV_COLUMNS, extrasaction="ignore",
+            )
+            if self._csv_fh.tell() == 0:
+                self._csv_writer.writeheader()
         self._lock = threading.Lock()
 
     def write(self, record: dict[str, Any]) -> None:
         with self._lock:
             self._ndjson_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._csv_writer.writerow(record)
+            if self._csv_writer is not None:
+                self._csv_writer.writerow(record)
 
     def flush(self) -> None:
         with self._lock:
             self._ndjson_fh.flush()
-            self._csv_fh.flush()
+            if self._csv_fh is not None:
+                self._csv_fh.flush()
 
     def close(self) -> None:
         self._ndjson_fh.close()
-        self._csv_fh.close()
+        if self._csv_fh is not None:
+            self._csv_fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +692,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override NDJSON path (default: auto-generated per page)",
     )
     parser.add_argument(
+        "--csv",
+        action="store_true",
+        default=False,
+        help="Also produce CSV output (default: NDJSON only)",
+    )
+    parser.add_argument(
         "--output-csv",
         default=None,
-        help="Override CSV path (default: auto-generated per page)",
+        help="Override CSV path (implies --csv)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -733,15 +745,21 @@ def main() -> None:
     logger.info("Pages to process: %s", [p["id"] for p in pages])
 
     try:
+        emit_csv = args.csv or args.output_csv is not None
         for page in pages:
             if shutdown_event.is_set():
                 break
-            csv_path = args.output_csv or _page_output_path(page, since, until, ".csv")
             ndjson_path = args.output_ndjson or _page_output_path(page, since, until, ".ndjson")
-            Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            csv_path = None
+            if emit_csv:
+                csv_path = args.output_csv or _page_output_path(page, since, until, ".csv")
+                Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
             Path(ndjson_path).parent.mkdir(parents=True, exist_ok=True)
             writers = StreamWriters(ndjson_path, csv_path)
-            logger.info("Output for page %s: %s / %s", page["id"], csv_path, ndjson_path)
+            if csv_path:
+                logger.info("Output for page %s: %s / %s", page["id"], ndjson_path, csv_path)
+            else:
+                logger.info("Output for page %s: %s", page["id"], ndjson_path)
             try:
                 process_page(
                     writers=writers,
