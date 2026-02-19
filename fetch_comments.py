@@ -553,6 +553,7 @@ def fetch_comments_for_post(
     post: dict[str, Any],
     delay: float,
     token: str,
+    visible_only: bool = False,
 ) -> int:
     """Fetch all comments (including nested replies) for a single post. Returns count."""
     post_id = post["id"]
@@ -605,6 +606,8 @@ def fetch_comments_for_post(
                 parent_comment_id=parent_comment_id,
                 depth_level=depth,
             )
+            if visible_only and record.get("is_hidden"):
+                continue
             writers.write(record)
             total += 1
 
@@ -726,6 +729,7 @@ def process_page(
     delay: float,
     max_workers: int,
     checkpoint_path: str,
+    visible_only: bool = False,
 ) -> int:
     page_id = page["id"]
     page_name = page["name"]
@@ -749,6 +753,7 @@ def process_page(
             return 0
         count = fetch_comments_for_post(
             page_session, writers, page_id, page_name, post, delay, token=page_token,
+            visible_only=visible_only,
         )
         logger.info("Post %s: %d comments", pid, count)
         return count
@@ -840,6 +845,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Split output into weekly files (ISO weeks, Mon–Sun). "
              "Files are saved in the same month folder.",
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        default=False,
+        help="Only include comments that are visible (is_hidden=False). "
+             "Hidden comments are silently skipped.",
     )
     parser.add_argument(
         "--clean",
@@ -978,6 +990,7 @@ def main() -> None:
                     delay=args.delay,
                     max_workers=args.max_workers,
                     checkpoint_path=args.checkpoint,
+                    visible_only=args.visible,
                 )
             except requests.exceptions.HTTPError as exc:
                 logger.error(
