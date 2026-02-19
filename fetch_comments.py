@@ -263,6 +263,19 @@ CSV_COLUMNS = [
     "message_tags",
 ]
 
+# --clean mode: token-efficient field set for LLM analysis
+CLEAN_CSV_COLUMNS = [
+    "created_time",
+    "post_id",
+    "depth_level",
+    "is_hidden",
+    "reaction_count",
+    "message",
+    "post_message",
+]
+
+POST_MESSAGE_MAX_LEN = 200
+
 
 def _safe_filename(name: str) -> str:
     """Transliterate to ASCII-safe filename: Ö→O, Å→A, Ä→A, etc."""
@@ -318,10 +331,51 @@ def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str,
     return str(Path(folder) / f"{safe_name}_{since_short}-{until_short}_comments{suffix}")
 
 
-class StreamWriters:
-    """Writes records as NDJSON and optionally CSV in streaming fashion."""
+def _clean_path(path: str) -> str:
+    """Insert ``_clean`` before file extension: ``foo.ndjson`` → ``foo_clean.ndjson``."""
+    p = Path(path)
+    return str(p.with_stem(p.stem + "_clean"))
 
-    def __init__(self, ndjson_path: str, csv_path: str | None = None) -> None:
+
+def _clean_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Create a token-efficient version of a comment record for LLM analysis.
+
+    Keeps only the fields needed for qualitative analysis and truncates
+    *post_message* to ``POST_MESSAGE_MAX_LEN`` characters.
+
+    ``reply_count`` is intentionally removed: reply structure can be derived
+    from ``depth_level`` (depth_level > 0 means the comment is a reply).
+    """
+    post_msg = record.get("post_message", "") or ""
+    if len(post_msg) > POST_MESSAGE_MAX_LEN:
+        post_msg = post_msg[:POST_MESSAGE_MAX_LEN] + "\u2026"  # "…"
+
+    return {
+        "created_time": record.get("created_time", ""),
+        "post_id": record.get("post_id", ""),
+        "depth_level": int(record.get("depth_level", 0)),
+        "is_hidden": bool(record.get("is_hidden", False)),
+        "reaction_count": int(record.get("reaction_count", 0)),
+        "message": record.get("message", ""),
+        "post_message": post_msg,
+    }
+
+
+class StreamWriters:
+    """Writes records as NDJSON and optionally CSV in streaming fashion.
+
+    When *clean_ndjson_path* is provided, an additional token-efficient
+    export is written in parallel (see ``_clean_record``).
+    """
+
+    def __init__(
+        self,
+        ndjson_path: str,
+        csv_path: str | None = None,
+        *,
+        clean_ndjson_path: str | None = None,
+        clean_csv_path: str | None = None,
+    ) -> None:
         self._ndjson_fh = open(ndjson_path, "a", encoding="utf-8")
         self._csv_fh = None
         self._csv_writer = None
@@ -332,24 +386,91 @@ class StreamWriters:
             )
             if self._csv_fh.tell() == 0:
                 self._csv_writer.writeheader()
+
+        # --clean outputs
+        self._clean_ndjson_fh = None
+        self._clean_csv_fh = None
+        self._clean_csv_writer = None
+        if clean_ndjson_path is not None:
+            self._clean_ndjson_fh = open(clean_ndjson_path, "a", encoding="utf-8")
+        if clean_csv_path is not None:
+            self._clean_csv_fh = open(clean_csv_path, "a", encoding="utf-8", newline="")
+            self._clean_csv_writer = csv.DictWriter(
+                self._clean_csv_fh, fieldnames=CLEAN_CSV_COLUMNS, extrasaction="ignore",
+            )
+            if self._clean_csv_fh.tell() == 0:
+                self._clean_csv_writer.writeheader()
+
+        # Stats (for --clean logging)
+        self._full_bytes = 0
+        self._clean_bytes = 0
+        self._row_count = 0
+        self._truncated_count = 0
+
         self._lock = threading.Lock()
+
+    # -- public properties for stats logging ----------------------------------
+
+    @property
+    def row_count(self) -> int:
+        return self._row_count
+
+    @property
+    def full_bytes(self) -> int:
+        return self._full_bytes
+
+    @property
+    def clean_bytes(self) -> int:
+        return self._clean_bytes
+
+    @property
+    def truncated_count(self) -> int:
+        return self._truncated_count
+
+    @property
+    def has_clean(self) -> bool:
+        return self._clean_ndjson_fh is not None
+
+    # -- core I/O -------------------------------------------------------------
 
     def write(self, record: dict[str, Any]) -> None:
         with self._lock:
-            self._ndjson_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            full_line = json.dumps(record, ensure_ascii=False) + "\n"
+            self._ndjson_fh.write(full_line)
+            self._full_bytes += len(full_line.encode("utf-8"))
+            self._row_count += 1
             if self._csv_writer is not None:
                 self._csv_writer.writerow(record)
+
+            if self._clean_ndjson_fh is not None:
+                post_msg = record.get("post_message", "") or ""
+                if len(post_msg) > POST_MESSAGE_MAX_LEN:
+                    self._truncated_count += 1
+                cleaned = _clean_record(record)
+                clean_line = json.dumps(cleaned, ensure_ascii=False) + "\n"
+                self._clean_ndjson_fh.write(clean_line)
+                self._clean_bytes += len(clean_line.encode("utf-8"))
+                if self._clean_csv_writer is not None:
+                    self._clean_csv_writer.writerow(cleaned)
 
     def flush(self) -> None:
         with self._lock:
             self._ndjson_fh.flush()
             if self._csv_fh is not None:
                 self._csv_fh.flush()
+            if self._clean_ndjson_fh is not None:
+                self._clean_ndjson_fh.flush()
+            if self._clean_csv_fh is not None:
+                self._clean_csv_fh.flush()
 
     def close(self) -> None:
         self._ndjson_fh.close()
         if self._csv_fh is not None:
             self._csv_fh.close()
+        if self._clean_ndjson_fh is not None:
+            self._clean_ndjson_fh.close()
+        if self._clean_csv_fh is not None:
+            self._clean_csv_fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +840,13 @@ def build_parser() -> argparse.ArgumentParser:
              "Files are saved in the same month folder.",
     )
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        default=False,
+        help="Also produce token-efficient *_clean files for LLM analysis "
+             "(reduced fields, truncated post_message).",
+    )
+    parser.add_argument(
         "--output-ndjson",
         default=None,
         help="Override NDJSON path (default: auto-generated per page)",
@@ -807,14 +935,35 @@ def main() -> None:
             else:
                 ndjson_path = args.output_ndjson or _page_output_path(page, item_since, item_until, ".ndjson")
                 csv_path = (args.output_csv or _page_output_path(page, item_since, item_until, ".csv")) if emit_csv else None
+
+            # --clean: derive *_clean paths from the primary paths
+            clean_ndjson_path: str | None = None
+            clean_csv_path: str | None = None
+            if args.clean:
+                clean_ndjson_path = _clean_path(ndjson_path)
+                if csv_path:
+                    clean_csv_path = _clean_path(csv_path)
+
+            # Ensure parent directories exist
             Path(ndjson_path).parent.mkdir(parents=True, exist_ok=True)
             if csv_path:
                 Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-            writers = StreamWriters(ndjson_path, csv_path)
+
+            writers = StreamWriters(
+                ndjson_path, csv_path,
+                clean_ndjson_path=clean_ndjson_path,
+                clean_csv_path=clean_csv_path,
+            )
+
+            parts = [ndjson_path]
             if csv_path:
-                logger.info("Output for page %s: %s / %s", page["id"], ndjson_path, csv_path)
-            else:
-                logger.info("Output for page %s: %s", page["id"], ndjson_path)
+                parts.append(csv_path)
+            if clean_ndjson_path:
+                parts.append(clean_ndjson_path)
+            if clean_csv_path:
+                parts.append(clean_csv_path)
+            logger.info("Output for page %s: %s", page["id"], " / ".join(parts))
+
             try:
                 process_page(
                     writers=writers,
@@ -831,6 +980,12 @@ def main() -> None:
                     page.get("name", "?"), page["id"], exc,
                 )
             finally:
+                if writers.has_clean and writers.row_count > 0:
+                    reduction = (1 - writers.clean_bytes / writers.full_bytes) * 100 if writers.full_bytes else 0
+                    logger.info(
+                        "Clean export: %d rows, %.1f%% size reduction, %d post_message(s) truncated",
+                        writers.row_count, reduction, writers.truncated_count,
+                    )
                 writers.close()
     except SystemExit:
         logger.info("Shutting down …")
