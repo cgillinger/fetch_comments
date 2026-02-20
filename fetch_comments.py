@@ -668,12 +668,19 @@ def resolve_pages(
     session: requests.Session,
     page_ids: Optional[list[str]],
     token: str,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], int]:
+    """Return *(pages_to_process, total_accessible)*.
+
+    *total_accessible* is the number of pages returned by ``/me/accounts``
+    before any filtering, so callers can compare it with how many were
+    actually processed.
+    """
     all_pages = _fetch_all_pages(session, token)
     if not all_pages:
         logger.error("No pages found for this token – exiting")
         sys.exit(1)
-    logger.info("Resolved %d page(s) from /me/accounts", len(all_pages))
+    total_accessible = len(all_pages)
+    logger.info("Resolved %d page(s) from /me/accounts", total_accessible)
 
     if page_ids:
         token_map = {p["id"]: p for p in all_pages}
@@ -696,7 +703,7 @@ def resolve_pages(
         logger.error("No pages remaining after filtering – exiting")
         sys.exit(1)
 
-    return pages
+    return pages, total_accessible
 
 
 def fetch_posts_for_page(
@@ -915,8 +922,12 @@ def main() -> None:
 
     validate_token(session, token)
 
-    pages = resolve_pages(session, args.page_ids, token)
+    pages, total_accessible = resolve_pages(session, args.page_ids, token)
     logger.info("Pages to process: %s", [p["id"] for p in pages])
+
+    # Track per-page results for the final summary.
+    # Each entry: (page_name, page_id, comment_count | None for failure)
+    page_results: list[tuple[str, str, int | None]] = []
 
     try:
         emit_csv = args.csv or args.output_csv is not None
@@ -980,6 +991,7 @@ def main() -> None:
                 logger.info("Output for page %s: %s", page["id"], " / ".join(parts))
 
             total_comments = 0
+            page_failed = False
             try:
                 total_comments = process_page(
                     writers=writers,
@@ -992,6 +1004,7 @@ def main() -> None:
                     visible_only=args.visible,
                 )
             except requests.exceptions.HTTPError as exc:
+                page_failed = True
                 logger.error(
                     "Skipping page %s (%s) – API error: %s",
                     page.get("name", "?"), page["id"], exc,
@@ -1013,10 +1026,47 @@ def main() -> None:
                         writers.close()
                         sys.exit(1)
                 writers.close()
+                page_results.append((
+                    page.get("name", "?"),
+                    page["id"],
+                    None if page_failed else total_comments,
+                ))
     except SystemExit:
         logger.info("Shutting down …")
 
-    logger.info("Done – total API requests: %d", request_counter)
+    # ------------------------------------------------------------------
+    # Final summary  (aggregate per page when --week produces duplicates)
+    # ------------------------------------------------------------------
+    per_page: dict[str, tuple[str, int, bool]] = {}  # id → (name, comments, any_failure)
+    for name, pid, count in page_results:
+        prev_name, prev_count, prev_fail = per_page.get(pid, (name, 0, False))
+        per_page[pid] = (
+            prev_name,
+            prev_count + (count if count is not None else 0),
+            prev_fail or count is None,
+        )
+
+    ok_pages = [(n, pid, c) for pid, (n, c, failed) in per_page.items() if not failed]
+    fail_pages = [(n, pid) for pid, (n, _c, failed) in per_page.items() if failed]
+
+    logger.info("=" * 60)
+    logger.info("SUMMARY")
+    logger.info("=" * 60)
+    logger.info("Token had access to %d page(s)", total_accessible)
+    logger.info("Attempted to fetch from %d page(s)", len(pages))
+    logger.info("Succeeded: %d | Failed: %d", len(ok_pages), len(fail_pages))
+    for name, pid, count in ok_pages:
+        logger.info("  OK   %-30s (%s) – %d comments", name, pid, count)
+    for name, pid in fail_pages:
+        logger.info("  FAIL %-30s (%s)", name, pid)
+    if len(ok_pages) < total_accessible:
+        logger.warning(
+            "Only %d of %d accessible page(s) returned data – "
+            "check errors above for details",
+            len(ok_pages), total_accessible,
+        )
+    logger.info("Total API requests: %d", request_counter)
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
