@@ -786,6 +786,22 @@ def process_page(
                 cp["last_page_id"] = page_id
                 cp["last_post_id"] = post["id"]
                 save_checkpoint(checkpoint_path, cp)
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status == 403:
+                    logger.warning(
+                        "Post %s skipped – Facebook returned 403 Forbidden. "
+                        "The page token does not have permission to read "
+                        "comments on this post. This is NOT a script error "
+                        "or network problem; the post likely has restricted "
+                        "visibility settings on Facebook's side.",
+                        post.get("id"),
+                    )
+                else:
+                    logger.exception(
+                        "HTTP %s error processing post %s",
+                        status, post.get("id"),
+                    )
             except Exception:
                 logger.exception("Error processing post %s", post.get("id"))
 
@@ -923,7 +939,14 @@ def main() -> None:
     validate_token(session, token)
 
     pages, total_accessible = resolve_pages(session, args.page_ids, token)
-    logger.info("Pages to process: %s", [p["id"] for p in pages])
+    logger.info("Token has access to %d page(s):", total_accessible)
+    for p in pages:
+        logger.info("  • %s (%s)", p.get("name", "?"), p["id"])
+    if len(pages) < total_accessible:
+        logger.info(
+            "  (%d page(s) filtered out by --page-ids or placeholder filter)",
+            total_accessible - len(pages),
+        )
 
     # Track per-page results for the final summary.
     # Each entry: (page_name, page_id, comment_count | None for failure)
