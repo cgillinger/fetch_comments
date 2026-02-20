@@ -939,7 +939,14 @@ def main() -> None:
     validate_token(session, token)
 
     pages, total_accessible = resolve_pages(session, args.page_ids, token)
-    logger.info("Pages to process: %s", [p["id"] for p in pages])
+    logger.info("Token has access to %d page(s):", total_accessible)
+    for p in pages:
+        logger.info("  • %s (%s)", p.get("name", "?"), p["id"])
+    if len(pages) < total_accessible:
+        logger.info(
+            "  (%d page(s) filtered out by --page-ids or placeholder filter)",
+            total_accessible - len(pages),
+        )
 
     # Track per-page results for the final summary.
     # Each entry: (page_name, page_id, comment_count | None for failure)
