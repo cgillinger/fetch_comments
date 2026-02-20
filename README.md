@@ -185,14 +185,15 @@ Produces: `data/output_clean.csv`
 | 3 | `depth_level` | integer | `0` = top-level, `1`+ = reply |
 | 4 | `is_hidden` | 0/1 | `1` = hidden by page admin |
 | 5 | `reaction_count` | integer | Total reactions (all types) |
-| 6 | `message` | string | Sanitised comment text |
+| 6 | `reply_count` | integer | Number of direct replies to this comment |
+| 7 | `message` | string | Sanitised comment text |
 
 No other columns are included.
 
 **Example row:**
 
 ```csv
-1730620917,163892707053917_1026716302894344,0,0,12,"Här är det redan vitt på marken."
+1730620917,163892707053917_1026716302894344,0,0,12,3,"Här är det redan vitt på marken."
 ```
 
 ### Field transformations
@@ -208,9 +209,7 @@ No other columns are included.
 
 ### Removed fields
 
-`page_id`, `page_name`, `post_created_time`, `post_permalink`, `post_message`, `comment_id`, `parent_comment_id`, `commenter_id`, `commenter_name`, `commenter_profile_link`, `like_count`, `reply_count`, `attachment_type`, `message_tags`.
-
-`reply_count` is excluded because replies can be derived from `depth_level` (`depth_level > 0` means the comment is a reply).
+`page_id`, `page_name`, `post_created_time`, `post_permalink`, `post_message`, `comment_id`, `parent_comment_id`, `commenter_id`, `commenter_name`, `commenter_profile_link`, `like_count`, `attachment_type`, `message_tags`.
 
 `post_message` is excluded to reduce token count — it repeats per comment and the post context can be joined via `post_id` when needed.
 

@@ -270,6 +270,7 @@ CLEAN_CSV_COLUMNS = [
     "depth_level",
     "is_hidden",
     "reaction_count",
+    "reply_count",
     "message",
 ]
 
@@ -340,9 +341,6 @@ def _clean_record(record: dict[str, Any]) -> dict[str, Any]:
     Converts ``created_time`` to a Unix timestamp, sanitises the message
     text for stable CSV / LLM ingestion, and maps ``is_hidden`` to 0/1.
 
-    ``reply_count`` is intentionally excluded: reply structure can be
-    derived from ``depth_level`` (depth_level > 0 means the comment is
-    a reply).
     """
     # created_time → Unix timestamp (seconds, UTC)
     created_time_unix: int | str = ""
@@ -368,6 +366,7 @@ def _clean_record(record: dict[str, Any]) -> dict[str, Any]:
         "depth_level": int(record.get("depth_level", 0)),
         "is_hidden": 1 if record.get("is_hidden", False) else 0,
         "reaction_count": int(record.get("reaction_count", 0)),
+        "reply_count": int(record.get("reply_count", 0)),
         "message": msg,
     }
 
