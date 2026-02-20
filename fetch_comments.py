@@ -786,6 +786,22 @@ def process_page(
                 cp["last_page_id"] = page_id
                 cp["last_post_id"] = post["id"]
                 save_checkpoint(checkpoint_path, cp)
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if status == 403:
+                    logger.warning(
+                        "Post %s skipped – Facebook returned 403 Forbidden. "
+                        "The page token does not have permission to read "
+                        "comments on this post. This is NOT a script error "
+                        "or network problem; the post likely has restricted "
+                        "visibility settings on Facebook's side.",
+                        post.get("id"),
+                    )
+                else:
+                    logger.exception(
+                        "HTTP %s error processing post %s",
+                        status, post.get("id"),
+                    )
             except Exception:
                 logger.exception("Error processing post %s", post.get("id"))
 
