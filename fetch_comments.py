@@ -372,11 +372,13 @@ def _clean_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 class StreamWriters:
-    """Writes records as NDJSON and optionally CSV in streaming fashion.
+    """Writes records as NDJSON and/or CSV in streaming fashion.
 
-    In **clean mode** (only *clean_csv_path* provided, no *ndjson_path*)
-    the writer produces a single token-efficient CSV — no NDJSON is
-    generated at all.
+    When *clean* is ``True`` the writer applies ``_clean_record()``
+    before writing and uses the reduced ``CLEAN_CSV_COLUMNS`` schema
+    for CSV output.  The clean transform is applied uniformly to both
+    NDJSON and CSV so the caller can freely combine ``--clean`` with
+    any ``--format``.
     """
 
     def __init__(
@@ -384,9 +386,11 @@ class StreamWriters:
         ndjson_path: str | None = None,
         csv_path: str | None = None,
         *,
-        clean_csv_path: str | None = None,
+        clean: bool = False,
     ) -> None:
-        # Full export outputs
+        self._clean = clean
+        csv_columns = CLEAN_CSV_COLUMNS if clean else CSV_COLUMNS
+
         self._ndjson_fh = None
         if ndjson_path is not None:
             self._ndjson_fh = open(ndjson_path, "a", encoding="utf-8")
@@ -396,24 +400,12 @@ class StreamWriters:
         if csv_path is not None:
             self._csv_fh = open(csv_path, "a", encoding="utf-8", newline="")
             self._csv_writer = csv.DictWriter(
-                self._csv_fh, fieldnames=CSV_COLUMNS, extrasaction="ignore",
+                self._csv_fh, fieldnames=csv_columns, extrasaction="ignore",
             )
             if self._csv_fh.tell() == 0:
                 self._csv_writer.writeheader()
 
-        # --clean output (CSV-only, no NDJSON)
-        self._clean_csv_fh = None
-        self._clean_csv_writer = None
-        if clean_csv_path is not None:
-            self._clean_csv_fh = open(clean_csv_path, "a", encoding="utf-8", newline="")
-            self._clean_csv_writer = csv.DictWriter(
-                self._clean_csv_fh, fieldnames=CLEAN_CSV_COLUMNS, extrasaction="ignore",
-            )
-            if self._clean_csv_fh.tell() == 0:
-                self._clean_csv_writer.writeheader()
-
         self._row_count = 0
-        self._clean_row_count = 0
         self._timestamp_failures = 0
         self._lock = threading.Lock()
 
@@ -424,21 +416,22 @@ class StreamWriters:
         return self._row_count
 
     @property
-    def clean_row_count(self) -> int:
-        return self._clean_row_count
-
-    @property
     def timestamp_failures(self) -> int:
         return self._timestamp_failures
 
     @property
-    def has_clean(self) -> bool:
-        return self._clean_csv_fh is not None
+    def is_clean(self) -> bool:
+        return self._clean
 
     # -- core I/O -------------------------------------------------------------
 
     def write(self, record: dict[str, Any]) -> None:
         with self._lock:
+            if self._clean:
+                record = _clean_record(record)
+                if record["created_time_unix"] == "":
+                    self._timestamp_failures += 1
+
             self._row_count += 1
 
             if self._ndjson_fh is not None:
@@ -448,29 +441,18 @@ class StreamWriters:
             if self._csv_writer is not None:
                 self._csv_writer.writerow(record)
 
-            if self._clean_csv_writer is not None:
-                cleaned = _clean_record(record)
-                if cleaned["created_time_unix"] == "":
-                    self._timestamp_failures += 1
-                self._clean_csv_writer.writerow(cleaned)
-                self._clean_row_count += 1
-
     def flush(self) -> None:
         with self._lock:
             if self._ndjson_fh is not None:
                 self._ndjson_fh.flush()
             if self._csv_fh is not None:
                 self._csv_fh.flush()
-            if self._clean_csv_fh is not None:
-                self._clean_csv_fh.flush()
 
     def close(self) -> None:
         if self._ndjson_fh is not None:
             self._ndjson_fh.close()
         if self._csv_fh is not None:
             self._csv_fh.close()
-        if self._clean_csv_fh is not None:
-            self._clean_csv_fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -879,25 +861,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--clean",
         action="store_true",
         default=False,
-        help="Produce only a token-efficient clean CSV (no NDJSON). "
-             "Optimised for LLM ingestion: 6 fields, Unix timestamps, "
-             "sanitised message text.",
+        help="Use token-efficient clean format: reduced field set, "
+             "Unix timestamps, sanitised message text. "
+             "Applies to all output formats (CSV/NDJSON). "
+             "Files are suffixed with _clean.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["csv", "ndjson", "both"],
+        default="both",
+        help="Output format: csv, ndjson, or both (default: both)",
     )
     parser.add_argument(
         "--output-ndjson",
         default=None,
-        help="Override NDJSON path (default: auto-generated per page)",
-    )
-    parser.add_argument(
-        "--csv",
-        action="store_true",
-        default=False,
-        help="Also produce CSV output (default: NDJSON only)",
+        help="Override NDJSON path (used when format includes ndjson)",
     )
     parser.add_argument(
         "--output-csv",
         default=None,
-        help="Override CSV path (implies --csv)",
+        help="Override CSV path (used when format includes csv)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -953,17 +936,15 @@ def main() -> None:
     page_results: list[tuple[str, str, int | None]] = []
 
     try:
-        emit_csv = args.csv or args.output_csv is not None
-
-        if args.clean and args.output_ndjson:
-            logger.warning("--output-ndjson is ignored in --clean mode (NDJSON not generated)")
+        emit_ndjson = args.format in ("ndjson", "both")
+        emit_csv = args.format in ("csv", "both")
 
         # Build work items: (page, item_since, item_until, folder_date)
         work_items: list[tuple[dict, str, str, str | None]] = []
         if args.week:
             weeks = _split_into_weeks(since, until)
             logger.info("Weekly split mode: %d chunk(s)", len(weeks))
-            if not args.clean and (args.output_ndjson or args.output_csv):
+            if args.output_ndjson or args.output_csv:
                 logger.warning(
                     "--output-ndjson / --output-csv ignored in --week mode "
                     "(paths are auto-generated per week)"
@@ -979,39 +960,44 @@ def main() -> None:
             if shutdown_event.is_set():
                 break
 
-            if args.clean:
-                # --clean mode: CSV-only, no NDJSON
-                if folder_date:
-                    base_csv = _page_output_path(page, item_since, item_until, ".csv", folder_date=folder_date)
-                else:
-                    base_csv = args.output_csv or _page_output_path(page, item_since, item_until, ".csv")
-                clean_csv_path = _clean_path(base_csv)
-                Path(clean_csv_path).parent.mkdir(parents=True, exist_ok=True)
+            # Determine output paths
+            ndjson_path = None
+            csv_path = None
 
-                writers = StreamWriters(clean_csv_path=clean_csv_path)
-                logger.info(
-                    "Clean CSV output for page %s: %s (NDJSON skipped)",
-                    page["id"], clean_csv_path,
-                )
-            else:
-                # Default mode: NDJSON + optional CSV
+            if emit_ndjson:
                 if folder_date:
                     ndjson_path = _page_output_path(page, item_since, item_until, ".ndjson", folder_date=folder_date)
-                    csv_path = _page_output_path(page, item_since, item_until, ".csv", folder_date=folder_date) if emit_csv else None
                 else:
                     ndjson_path = args.output_ndjson or _page_output_path(page, item_since, item_until, ".ndjson")
-                    csv_path = (args.output_csv or _page_output_path(page, item_since, item_until, ".csv")) if emit_csv else None
 
+            if emit_csv:
+                if folder_date:
+                    csv_path = _page_output_path(page, item_since, item_until, ".csv", folder_date=folder_date)
+                else:
+                    csv_path = args.output_csv or _page_output_path(page, item_since, item_until, ".csv")
+
+            # In clean mode, add _clean suffix to filenames
+            if args.clean:
+                if ndjson_path:
+                    ndjson_path = _clean_path(ndjson_path)
+                if csv_path:
+                    csv_path = _clean_path(csv_path)
+
+            # Create directories
+            if ndjson_path:
                 Path(ndjson_path).parent.mkdir(parents=True, exist_ok=True)
-                if csv_path:
-                    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+            if csv_path:
+                Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
 
-                writers = StreamWriters(ndjson_path, csv_path)
+            writers = StreamWriters(ndjson_path, csv_path, clean=args.clean)
 
-                parts = [ndjson_path]
-                if csv_path:
-                    parts.append(csv_path)
-                logger.info("Output for page %s: %s", page["id"], " / ".join(parts))
+            # Log output paths
+            parts = []
+            if ndjson_path:
+                parts.append(ndjson_path)
+            if csv_path:
+                parts.append(csv_path)
+            logger.info("Output for page %s: %s", page["id"], " / ".join(parts))
 
             total_comments = 0
             page_failed = False
@@ -1033,18 +1019,18 @@ def main() -> None:
                     page.get("name", "?"), page["id"], exc,
                 )
             finally:
-                if writers.has_clean:
+                if writers.is_clean:
                     if writers.timestamp_failures > 0:
                         logger.warning(
                             "Timestamp parse failures: %d", writers.timestamp_failures,
                         )
                     logger.info(
-                        "Clean export: %d rows written to CSV", writers.clean_row_count,
+                        "Clean export: %d rows written", writers.row_count,
                     )
-                    if total_comments != writers.clean_row_count:
+                    if total_comments != writers.row_count:
                         logger.error(
                             "Row count mismatch: processed %d comments but wrote %d clean rows",
-                            total_comments, writers.clean_row_count,
+                            total_comments, writers.row_count,
                         )
                         writers.close()
                         sys.exit(1)
