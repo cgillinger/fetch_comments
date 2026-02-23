@@ -225,15 +225,48 @@ def paginate_all(
 
 def load_checkpoint(path: str) -> dict[str, Any]:
     p = Path(path)
-    if p.exists():
+    if not p.exists():
+        return {}
+    try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            logger.warning("Checkpoint %s contains non-dict data – ignoring", path)
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError) as exc:
+        # Attempt to read the backup written by save_checkpoint
+        backup = Path(path + ".bak")
+        if backup.exists():
+            logger.warning(
+                "Checkpoint %s corrupt (%s) – restoring from backup", path, exc,
+            )
+            try:
+                with open(backup, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as exc2:
+                logger.error("Backup checkpoint also corrupt: %s", exc2)
+        else:
+            logger.warning("Checkpoint %s corrupt (%s) – starting fresh", path, exc)
+        return {}
 
 
 def save_checkpoint(path: str, data: dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    """Atomically write checkpoint: write to temp file, then os.replace."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    # Keep a backup of the previous checkpoint before replacing
+    p = Path(path)
+    if p.exists():
+        backup = path + ".bak"
+        try:
+            os.replace(path, backup)
+        except OSError:
+            pass
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -730,15 +763,51 @@ def process_page(
     page_session = requests.Session()
 
     checkpoint = load_checkpoint(checkpoint_path)
+
+    # Check if this page+date range was already fully completed
+    completed_pages: list[str] = checkpoint.get("completed_pages", [])
+    page_range_key = f"{page_id}:{since}:{until}"
+    if page_range_key in completed_pages:
+        logger.info(
+            "Page %s (%s) already fully completed in checkpoint – skipping entirely",
+            page_name, page_id,
+        )
+        return 0
+
     completed_posts: set[str] = set(checkpoint.get("completed_posts", {}).get(page_id, []))
 
     posts = fetch_posts_for_page(page_session, page_id, since, until, delay, token=page_token)
 
+    # Separate posts into already-completed and pending
+    pending_posts = []
+    skipped_count = 0
+    for post in posts:
+        if post["id"] in completed_posts:
+            skipped_count += 1
+        else:
+            pending_posts.append(post)
+
+    if skipped_count > 0:
+        logger.info(
+            "Page %s: %d/%d posts already in checkpoint – skipping them, %d to process",
+            page_id, skipped_count, len(posts), len(pending_posts),
+        )
+
+    if not pending_posts:
+        # All posts already processed – mark page as fully completed
+        cp = load_checkpoint(checkpoint_path)
+        cp.setdefault("completed_pages", [])
+        if page_range_key not in cp["completed_pages"]:
+            cp["completed_pages"].append(page_range_key)
+        save_checkpoint(checkpoint_path, cp)
+        logger.info(
+            "Page %s done – all %d posts already processed (checkpoint)",
+            page_id, len(posts),
+        )
+        return 0
+
     def _handle_post(post: dict[str, Any]) -> int:
         pid = post["id"]
-        if pid in completed_posts:
-            logger.debug("Skipping already-processed post %s", pid)
-            return 0
         count = fetch_comments_for_post(
             page_session, writers, page_id, page_name, post, delay, token=page_token,
             visible_only=visible_only,
@@ -747,10 +816,11 @@ def process_page(
         return count
 
     total_comments = 0
+    errors = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_post = {
-            executor.submit(_handle_post, post): post for post in posts
+            executor.submit(_handle_post, post): post for post in pending_posts
         }
         for future in as_completed(future_to_post):
             if shutdown_event.is_set():
@@ -760,15 +830,16 @@ def process_page(
             try:
                 n = future.result()
                 total_comments += n
-                # Update checkpoint
+                # Update checkpoint only for newly completed posts
                 cp = load_checkpoint(checkpoint_path)
                 cp.setdefault("completed_posts", {}).setdefault(page_id, [])
                 if post["id"] not in cp["completed_posts"][page_id]:
                     cp["completed_posts"][page_id].append(post["id"])
-                cp["last_page_id"] = page_id
-                cp["last_post_id"] = post["id"]
-                save_checkpoint(checkpoint_path, cp)
+                    cp["last_page_id"] = page_id
+                    cp["last_post_id"] = post["id"]
+                    save_checkpoint(checkpoint_path, cp)
             except requests.exceptions.HTTPError as exc:
+                errors += 1
                 status = getattr(exc.response, "status_code", None)
                 if status == 403:
                     logger.warning(
@@ -785,11 +856,22 @@ def process_page(
                         status, post.get("id"),
                     )
             except Exception:
+                errors += 1
                 logger.exception("Error processing post %s", post.get("id"))
+
+    # Mark page as fully completed if all pending posts succeeded
+    if errors == 0 and not shutdown_event.is_set():
+        cp = load_checkpoint(checkpoint_path)
+        cp.setdefault("completed_pages", [])
+        if page_range_key not in cp["completed_pages"]:
+            cp["completed_pages"].append(page_range_key)
+        save_checkpoint(checkpoint_path, cp)
 
     writers.flush()
     logger.info(
-        "Page %s done – %d comments from %d posts", page_id, total_comments, len(posts),
+        "Page %s done – %d new comments from %d pending posts "
+        "(%d skipped, %d errors)",
+        page_id, total_comments, len(pending_posts), skipped_count, errors,
     )
     return total_comments
 
