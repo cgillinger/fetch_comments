@@ -348,6 +348,31 @@ def _split_into_weeks(since: str, until: str) -> list[tuple[str, str]]:
     return weeks
 
 
+def _split_into_months(since: str, until: str) -> list[tuple[str, str]]:
+    """Split a date range into calendar-month chunks.
+
+    The first and last chunks may be partial months, clipped to the
+    overall since/until boundaries.  Returns a list of
+    (start_date, end_date) ISO-8601 string pairs.
+    """
+    from calendar import monthrange
+
+    start = date.fromisoformat(since)
+    end = date.fromisoformat(until)
+    months: list[tuple[str, str]] = []
+    current = start
+    while current <= end:
+        last_day_of_month = monthrange(current.year, current.month)[1]
+        month_end = min(date(current.year, current.month, last_day_of_month), end)
+        months.append((current.isoformat(), month_end.isoformat()))
+        # Move to first day of next month
+        if month_end.month == 12:
+            current = date(month_end.year + 1, 1, 1)
+        else:
+            current = date(month_end.year, month_end.month + 1, 1)
+    return months
+
+
 def _page_output_path(page: dict[str, str], since: str, until: str, suffix: str, *, folder_date: str | None = None) -> str:
     """Build output path: 26-JAN/PageName_YYMMDD-YYMMDD_comments.ext
 
@@ -925,12 +950,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_date,
         help="End date (ISO-8601, e.g. 2024-12-31)",
     )
-    parser.add_argument(
+    split_group = parser.add_mutually_exclusive_group()
+    split_group.add_argument(
         "--week",
         action="store_true",
         default=False,
         help="Split output into weekly files (ISO weeks, Mon–Sun). "
              "Files are saved in the same month folder.",
+    )
+    split_group.add_argument(
+        "--month",
+        action="store_true",
+        default=False,
+        help="Split output into monthly files (calendar months). "
+             "Each month gets its own file in the corresponding month folder.",
     )
     parser.add_argument(
         "--visible",
@@ -1034,6 +1067,17 @@ def main() -> None:
             for page in pages:
                 for w_since, w_until in weeks:
                     work_items.append((page, w_since, w_until, w_since))
+        elif args.month:
+            months = _split_into_months(since, until)
+            logger.info("Monthly split mode: %d chunk(s)", len(months))
+            if args.output_ndjson or args.output_csv:
+                logger.warning(
+                    "--output-ndjson / --output-csv ignored in --month mode "
+                    "(paths are auto-generated per month)"
+                )
+            for page in pages:
+                for m_since, m_until in months:
+                    work_items.append((page, m_since, m_until, m_since))
         else:
             for page in pages:
                 work_items.append((page, since, until, None))
@@ -1126,7 +1170,7 @@ def main() -> None:
         logger.info("Shutting down …")
 
     # ------------------------------------------------------------------
-    # Final summary  (aggregate per page when --week produces duplicates)
+    # Final summary  (aggregate per page when --week/--month produces duplicates)
     # ------------------------------------------------------------------
     per_page: dict[str, tuple[str, int, bool]] = {}  # id → (name, comments, any_failure)
     for name, pid, count in page_results:

@@ -69,6 +69,7 @@ These dates filter by **post publication date**, not comment creation date. All 
 | `--access-token` | from env/`.env` | Meta Graph API access token |
 | `--page-ids` | all accessible pages | Space-separated list of specific Page IDs to process |
 | `--week` | off | Split output into weekly files (ISO weeks, Mon–Sun) |
+| `--month` | off | Split output into monthly files (calendar months) |
 | `--clean` | off | Produce only a token-efficient clean CSV (no NDJSON) |
 | `--output-ndjson` | auto-generated | Override NDJSON path |
 | `--csv` | off | Also produce CSV output |
@@ -92,6 +93,24 @@ python fetch_comments.py \
   --page-ids 123456789 987654321 \
   --since 2024-06-01 \
   --until 2024-06-30
+```
+
+Split output into one file per calendar month:
+
+```bash
+python fetch_comments.py \
+  --since 2024-09-01 \
+  --until 2024-12-31 \
+  --month
+```
+
+This produces separate files in monthly folders:
+
+```
+24-SEP/PageName_240901-240930_comments.csv
+24-OKT/PageName_241001-241031_comments.csv
+24-NOV/PageName_241101-241130_comments.csv
+24-DEC/PageName_241201-241231_comments.csv
 ```
 
 With a conservative delay to avoid rate limits:
@@ -218,7 +237,12 @@ No other columns are included.
 ```bash
 # Clean + weekly split
 python fetch_comments.py --since 2025-10-01 --until 2025-10-31 --week --clean
+
+# Clean + monthly split
+python fetch_comments.py --since 2025-09-01 --until 2025-12-31 --month --clean
 ```
+
+> **Note:** `--week` and `--month` are mutually exclusive — you can use one or the other, but not both.
 
 ## Resume / Checkpoint
 
