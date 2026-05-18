@@ -196,7 +196,6 @@ def paginate_all(
     session: requests.Session,
     url: str,
     params: Optional[dict[str, Any]] = None,
-    delay: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Follow paging.next until exhausted. Returns aggregated data list."""
     results: list[dict[str, Any]] = []
@@ -206,7 +205,7 @@ def paginate_all(
     while True:
         if shutdown_event.is_set():
             break
-        body = api_get(session, current_url, params=current_params, delay=delay)
+        body = api_get(session, current_url, params=current_params)
         data = body.get("data", [])
         results.extend(data)
 
@@ -269,6 +268,52 @@ def save_checkpoint(path: str, data: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
+class CheckpointManager:
+    """Håller checkpoint i minne, flushar till disk periodiskt."""
+
+    def __init__(self, path: str, flush_every: int = 20):
+        self._path = path
+        self._flush_every = flush_every
+        self._data = load_checkpoint(path)
+        self._dirty = 0
+        self._lock = threading.Lock()
+
+    def is_page_completed(self, page_range_key: str) -> bool:
+        with self._lock:
+            return page_range_key in self._data.get("completed_pages", [])
+
+    def get_completed_posts(self, page_id: str) -> set[str]:
+        with self._lock:
+            return set(self._data.get("completed_posts", {}).get(page_id, []))
+
+    def mark_post_completed(self, page_id: str, post_id: str) -> None:
+        with self._lock:
+            self._data.setdefault("completed_posts", {}).setdefault(page_id, [])
+            if post_id not in self._data["completed_posts"][page_id]:
+                self._data["completed_posts"][page_id].append(post_id)
+                self._data["last_page_id"] = page_id
+                self._data["last_post_id"] = post_id
+                self._dirty += 1
+                if self._dirty >= self._flush_every:
+                    self._flush_unlocked()
+
+    def mark_page_completed(self, page_range_key: str) -> None:
+        with self._lock:
+            self._data.setdefault("completed_pages", [])
+            if page_range_key not in self._data["completed_pages"]:
+                self._data["completed_pages"].append(page_range_key)
+                self._flush_unlocked()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty > 0:
+                self._flush_unlocked()
+
+    def _flush_unlocked(self) -> None:
+        save_checkpoint(self._path, self._data)
+        self._dirty = 0
+
+
 # ---------------------------------------------------------------------------
 # Writers
 # ---------------------------------------------------------------------------
@@ -280,7 +325,11 @@ CSV_COLUMNS = [
     "post_created_time",
     "post_permalink",
     "post_message",
+    "post_status_type",
+    "post_attachment_type",
+    "post_attachment_url",
     "comment_id",
+    "comment_permalink",
     "parent_comment_id",
     "depth_level",
     "created_time",
@@ -293,6 +342,10 @@ CSV_COLUMNS = [
     "reply_count",
     "is_hidden",
     "attachment_type",
+    "attachment_url",
+    "attachment_media_url",
+    "attachment_title",
+    "attachment_description",
     "message_tags",
 ]
 
@@ -525,6 +578,9 @@ def _extract_comment_record(
     post_created_time: str,
     post_permalink: str,
     post_message: str,
+    post_status_type: str,
+    post_attachment_type: str,
+    post_attachment_url: str,
     parent_comment_id: Optional[str],
     depth_level: int,
 ) -> dict[str, Any]:
@@ -537,6 +593,13 @@ def _extract_comment_record(
 
     attachment = comment.get("attachment") or {}
     attachment_type = attachment.get("type", "")
+    attachment_url = attachment.get("url", "")
+    attachment_title = attachment.get("title", "")
+    attachment_description = attachment.get("description", "")
+
+    media = attachment.get("media") or {}
+    media_image = media.get("image") or {}
+    attachment_media_url = media_image.get("src") or media.get("source") or ""
 
     reactions_summary = (comment.get("reactions") or {}).get("summary", {})
     reaction_count = reactions_summary.get("total_count", 0)
@@ -554,7 +617,11 @@ def _extract_comment_record(
         "post_created_time": post_created_time,
         "post_permalink": post_permalink,
         "post_message": post_message,
+        "post_status_type": post_status_type,
+        "post_attachment_type": post_attachment_type,
+        "post_attachment_url": post_attachment_url,
         "comment_id": comment.get("id", ""),
+        "comment_permalink": comment.get("permalink_url", ""),
         "parent_comment_id": parent_comment_id or "",
         "depth_level": depth_level,
         "created_time": comment.get("created_time", ""),
@@ -567,6 +634,10 @@ def _extract_comment_record(
         "reply_count": comment.get("comment_count", 0),
         "is_hidden": comment.get("is_hidden", False),
         "attachment_type": attachment_type,
+        "attachment_url": attachment_url,
+        "attachment_media_url": attachment_media_url,
+        "attachment_title": attachment_title,
+        "attachment_description": attachment_description,
         "message_tags": tags_str,
     }
 
@@ -590,7 +661,6 @@ def fetch_comments_for_post(
     page_id: str,
     page_name: str,
     post: dict[str, Any],
-    delay: float,
     token: str,
     visible_only: bool = False,
 ) -> int:
@@ -599,6 +669,10 @@ def fetch_comments_for_post(
     post_created_time = post.get("created_time", "")
     post_permalink = post.get("permalink_url", "")
     post_message = post.get("message", "")
+    post_status_type = post.get("status_type", "")
+    post_attachments = (post.get("attachments") or {}).get("data", [])
+    post_attachment_type = post_attachments[0].get("type", "") if post_attachments else ""
+    post_attachment_url = post_attachments[0].get("url", "") if post_attachments else ""
     total = 0
 
     def _fetch_level(
@@ -617,7 +691,7 @@ def fetch_comments_for_post(
             "limit": DEFAULT_LIMIT,
         }
         try:
-            comments = paginate_all(session, url, params=params, delay=delay)
+            comments = paginate_all(session, url, params=params)
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 400:
                 logger.info(
@@ -642,6 +716,9 @@ def fetch_comments_for_post(
                 post_created_time=post_created_time,
                 post_permalink=post_permalink,
                 post_message=post_message,
+                post_status_type=post_status_type,
+                post_attachment_type=post_attachment_type,
+                post_attachment_url=post_attachment_url,
                 parent_comment_id=parent_comment_id,
                 depth_level=depth,
             )
@@ -704,6 +781,72 @@ def _filter_placeholders(pages: list[dict[str, str]]) -> list[dict[str, str]]:
     return filtered
 
 
+PAGE_FILTER_GROUPS = {
+    "p4lokalt": {
+        "description": "Alla 25 lokala P4-stationer",
+        "match": lambda name: (
+            name.startswith("P4 ")
+            and not any(name.startswith(prefix) for prefix in (
+                "P4 Extra", "P4 DANS", "P4 Plus",
+            ))
+        ),
+    },
+    "riks": {
+        "description": "Alla rikskonton (ej P4 lokalt)",
+        "match": lambda name: not PAGE_FILTER_GROUPS["p4lokalt"]["match"](name),
+    },
+    "p1": {
+        "description": "P1-relaterade sidor",
+        "match": lambda name: "P1" in name,
+    },
+    "p2": {
+        "description": "P2-relaterade sidor",
+        "match": lambda name: "P2" in name,
+    },
+    "p3": {
+        "description": "P3-relaterade sidor",
+        "match": lambda name: "P3" in name,
+    },
+    "ekot": {
+        "description": "Ekot/nyhetssidor",
+        "match": lambda name: "Ekot" in name,
+    },
+    "minoritet": {
+        "description": "Minoritets- och språkredaktioner",
+        "match": lambda name: any(kw in name for kw in [
+            "Sameradion", "Radio Romano", "Finska",
+            "Meänraatio", "Terni Generatcia",
+            "Radio Sweden Somali", "Radio Sweden Arabic",
+            "Radio Sweden Farsi", "Radio Sweden på lätt",
+            "Raadiyaha",
+        ]),
+    },
+}
+
+
+def apply_page_filter(pages, filter_name):
+    key = filter_name.lower()
+    if key not in PAGE_FILTER_GROUPS:
+        logger.error("Okänt filter: '%s'. Använd --filter list för tillgängliga filter.", filter_name)
+        return None
+    match_fn = PAGE_FILTER_GROUPS[key]["match"]
+    filtered = [p for p in pages if match_fn(p.get("name", ""))]
+    logger.info("Filter '%s': %d sidor matchar, %d filtrerade bort", key, len(filtered), len(pages) - len(filtered))
+    return filtered
+
+
+def print_filter_list(pages):
+    logger.info("=" * 70)
+    logger.info("TILLGÄNGLIGA FILTER (--filter <namn>)")
+    logger.info("=" * 70)
+    for key, cfg in PAGE_FILTER_GROUPS.items():
+        matching = sorted(p.get("name", p["id"]) for p in pages if cfg["match"](p.get("name", "")))
+        logger.info("  %-12s  %s (%d sidor)", key, cfg["description"], len(matching))
+        for name in matching:
+            logger.info("    • %s", name)
+    logger.info("=" * 70)
+
+
 def resolve_pages(
     session: requests.Session,
     page_ids: Optional[list[str]],
@@ -751,7 +894,6 @@ def fetch_posts_for_page(
     page_id: str,
     since: str,
     until: str,
-    delay: float,
     token: str,
 ) -> list[dict[str, Any]]:
     url = f"{GRAPH_API_BASE}/{page_id}/posts"
@@ -762,7 +904,7 @@ def fetch_posts_for_page(
         "until": until,
         "limit": DEFAULT_LIMIT,
     }
-    posts = paginate_all(session, url, params=params, delay=delay)
+    posts = paginate_all(session, url, params=params)
     logger.info("Page %s: fetched %d posts", page_id, len(posts))
     return posts
 
@@ -774,7 +916,7 @@ def process_page(
     until: str,
     delay: float,
     max_workers: int,
-    checkpoint_path: str,
+    checkpoint: CheckpointManager,
     visible_only: bool = False,
 ) -> int:
     page_id = page["id"]
@@ -787,21 +929,18 @@ def process_page(
 
     page_session = requests.Session()
 
-    checkpoint = load_checkpoint(checkpoint_path)
-
     # Check if this page+date range was already fully completed
-    completed_pages: list[str] = checkpoint.get("completed_pages", [])
     page_range_key = f"{page_id}:{since}:{until}"
-    if page_range_key in completed_pages:
+    if checkpoint.is_page_completed(page_range_key):
         logger.info(
             "Page %s (%s) already fully completed in checkpoint – skipping entirely",
             page_name, page_id,
         )
         return 0
 
-    completed_posts: set[str] = set(checkpoint.get("completed_posts", {}).get(page_id, []))
+    completed_posts = checkpoint.get_completed_posts(page_id)
 
-    posts = fetch_posts_for_page(page_session, page_id, since, until, delay, token=page_token)
+    posts = fetch_posts_for_page(page_session, page_id, since, until, token=page_token)
 
     # Separate posts into already-completed and pending
     pending_posts = []
@@ -820,11 +959,7 @@ def process_page(
 
     if not pending_posts:
         # All posts already processed – mark page as fully completed
-        cp = load_checkpoint(checkpoint_path)
-        cp.setdefault("completed_pages", [])
-        if page_range_key not in cp["completed_pages"]:
-            cp["completed_pages"].append(page_range_key)
-        save_checkpoint(checkpoint_path, cp)
+        checkpoint.mark_page_completed(page_range_key)
         logger.info(
             "Page %s done – all %d posts already processed (checkpoint)",
             page_id, len(posts),
@@ -833,8 +968,10 @@ def process_page(
 
     def _handle_post(post: dict[str, Any]) -> int:
         pid = post["id"]
+        if delay > 0:
+            time.sleep(delay)
         count = fetch_comments_for_post(
-            page_session, writers, page_id, page_name, post, delay, token=page_token,
+            page_session, writers, page_id, page_name, post, token=page_token,
             visible_only=visible_only,
         )
         logger.info("Post %s: %d comments", pid, count)
@@ -855,14 +992,7 @@ def process_page(
             try:
                 n = future.result()
                 total_comments += n
-                # Update checkpoint only for newly completed posts
-                cp = load_checkpoint(checkpoint_path)
-                cp.setdefault("completed_posts", {}).setdefault(page_id, [])
-                if post["id"] not in cp["completed_posts"][page_id]:
-                    cp["completed_posts"][page_id].append(post["id"])
-                    cp["last_page_id"] = page_id
-                    cp["last_post_id"] = post["id"]
-                    save_checkpoint(checkpoint_path, cp)
+                checkpoint.mark_post_completed(page_id, post["id"])
             except requests.exceptions.HTTPError as exc:
                 errors += 1
                 status = getattr(exc.response, "status_code", None)
@@ -886,11 +1016,7 @@ def process_page(
 
     # Mark page as fully completed if all pending posts succeeded
     if errors == 0 and not shutdown_event.is_set():
-        cp = load_checkpoint(checkpoint_path)
-        cp.setdefault("completed_pages", [])
-        if page_range_key not in cp["completed_pages"]:
-            cp["completed_pages"].append(page_range_key)
-        save_checkpoint(checkpoint_path, cp)
+        checkpoint.mark_page_completed(page_range_key)
 
     writers.flush()
     logger.info(
@@ -937,6 +1063,12 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=None,
         help="Specific page IDs to process (default: all accessible pages)",
+    )
+    parser.add_argument(
+        "--filter",
+        default=None,
+        help='Filtrera sidor efter fördefinierad grupp (t.ex. p4lokalt, riks, p1). '
+             'Använd "--filter list" för att visa tillgängliga filter och vilka sidor de matchar.',
     )
     parser.add_argument(
         "--since",
@@ -1046,6 +1178,19 @@ def main() -> None:
             total_accessible - len(pages),
         )
 
+    if args.filter:
+        if args.filter.lower() == "list":
+            print_filter_list(pages)
+            return
+        pages = apply_page_filter(pages, args.filter)
+        if pages is None:
+            sys.exit(1)
+        if not pages:
+            logger.error("Inga sidor matchade filtret '%s'. Avbryter.", args.filter)
+            sys.exit(1)
+
+    checkpoint = CheckpointManager(args.checkpoint)
+
     # Track per-page results for the final summary.
     # Each entry: (page_name, page_id, comment_count | None for failure)
     page_results: list[tuple[str, str, int | None]] = []
@@ -1082,6 +1227,8 @@ def main() -> None:
             for page in pages:
                 work_items.append((page, since, until, None))
 
+        total_items = len(work_items)
+        done_items = 0
         for page, item_since, item_until, folder_date in work_items:
             if shutdown_event.is_set():
                 break
@@ -1135,7 +1282,7 @@ def main() -> None:
                     until=item_until,
                     delay=args.delay,
                     max_workers=args.max_workers,
-                    checkpoint_path=args.checkpoint,
+                    checkpoint=checkpoint,
                     visible_only=args.visible,
                 )
             except requests.exceptions.HTTPError as exc:
@@ -1166,8 +1313,16 @@ def main() -> None:
                     page["id"],
                     None if page_failed else total_comments,
                 ))
+                checkpoint.flush()
+                done_items += 1
+                logger.info(
+                    "Progress: %d/%d klara, %d kvar",
+                    done_items, total_items, total_items - done_items,
+                )
     except SystemExit:
         logger.info("Shutting down …")
+    finally:
+        checkpoint.flush()
 
     # ------------------------------------------------------------------
     # Final summary  (aggregate per page when --week/--month produces duplicates)
