@@ -2,6 +2,8 @@
 
 Downloads all comments (including nested replies) from Facebook Page posts using the Meta Graph API v22.0.
 
+> This is a personal hobby project I build for my own use and publish in case it's useful to someone else. I work on it in my spare time, so issues and PRs are welcome but replies may be slow. Use at your own risk.
+
 ## Requirements
 
 - Python 3.11+
